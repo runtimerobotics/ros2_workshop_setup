@@ -31,7 +31,7 @@ jobs:
       - name: Install (piped, with a shadowing python3 on PATH)
         run: |
           su student -c "python3 -m venv ~/shadow-venv"
-          su student -c "cd ~ && export PATH=\$HOME/shadow-venv/bin:\$PATH && cat $GITHUB_WORKSPACE/install.sh | bash -s -- --yes --docker skip"
+          su student -c "cd ~ && export PATH=\$HOME/shadow-venv/bin:\$PATH && cat $GITHUB_WORKSPACE/install.sh | bash -s ros --yes"
       - name: Re-run is safe
         run: su student -c "cd ~ && bash $GITHUB_WORKSPACE/install.sh --yes --docker skip"
 
@@ -44,4 +44,4 @@ jobs:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - name: Install (piped)
-        run: cat install.sh | bash -s -- --yes --docker cpu
+        run: cat install.sh | bash -s cpu --yes

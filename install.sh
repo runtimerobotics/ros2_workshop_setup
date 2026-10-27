@@ -8,7 +8,7 @@
 #
 # One-liner (run as your normal user, NOT with sudo):
 #   curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh | bash -s -- --docker gpu
+#   curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh | bash -s gpu
 #
 # Or download first and inspect:
 #   curl -fsSLO https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh
@@ -37,8 +37,15 @@ trap '((BASH_SUBSHELL)) || printf "\n%s ERROR: command failed (line %s): %s\nRe-
 
 usage() {
   cat <<'HELP'
-Usage: install.sh [OPTIONS]
-  (piped:  curl -fsSL <url>/install.sh | bash -s -- [OPTIONS])
+Usage: install.sh [MODE] [OPTIONS]
+  (piped:  curl -fsSL <url>/install.sh | bash -s MODE [OPTIONS])
+
+Modes (shortcuts):
+  gpu                 ROS 2 + simulation + Docker with NVIDIA GPU
+  cpu                 ROS 2 + simulation + Docker without GPU
+  ros                 ROS 2 + simulation, no Docker
+  docker-gpu          Only Docker with NVIDIA GPU
+  docker-cpu          Only Docker without GPU
 
 Docker:
   --docker auto       GPU Docker if nvidia-smi works, otherwise CPU (default)
@@ -368,6 +375,9 @@ main() {
     case "$1" in
       --docker) (($# >= 2)) || die "--docker needs auto, gpu, cpu or skip"; DOCKER_MODE="$2"; shift 2 ;;
       --docker=*) DOCKER_MODE="${1#*=}"; shift ;;
+      gpu|cpu|auto) DOCKER_MODE="$1"; shift ;;
+      ros|nodocker) DOCKER_MODE=skip; shift ;;
+      docker-gpu|docker-cpu) INSTALL_ROS=false; DOCKER_MODE="${1#docker-}"; shift ;;
       --gpu) DOCKER_MODE=gpu; shift ;;
       --cpu|--no-gpu) DOCKER_MODE=cpu; shift ;;
       --docker-only|--no-ros) INSTALL_ROS=false; shift ;;
@@ -415,7 +425,7 @@ main() {
     if gpu_driver_ok; then DOCKER_MODE=gpu
     else DOCKER_MODE=cpu; warn "No working NVIDIA driver (nvidia-smi); using CPU Docker."; fi
   elif [[ "$DOCKER_MODE" == gpu ]] && ! gpu_driver_ok; then
-    die "GPU mode needs a working NVIDIA driver. Install one (sudo ubuntu-drivers install), reboot, and re-run, or use --docker cpu."
+    die "GPU mode needs a working NVIDIA driver. Install one (sudo ubuntu-drivers install), reboot, and re-run, or use the cpu mode instead."
   fi
 
   say "ROS 2 workshop installer $SCRIPT_VERSION"
@@ -428,11 +438,11 @@ main() {
   printf '\nThis installs apt packages and apt sources with sudo and may restart Docker.\n'
   if [[ "$ASSUME_YES" != true ]]; then
     local reply
-    reply="$(ask 'Continue? [y/N] ')" || die "No terminal to ask for confirmation. Re-run with --yes (e.g. ... | bash -s -- --yes)."
+    reply="$(ask 'Continue? [y/N] ')" || die "No terminal to ask for confirmation. Re-run with --yes (e.g. ... | bash -s cpu --yes)."
     [[ "$reply" =~ ^[Yy]([Ee][Ss])?$ ]] || die "Cancelled; nothing was changed."
   fi
 
-  say "Asking for your sudo password (once)"
+  say "Enter your login password if asked (nothing appears while you type; that is normal)"
   sudo -v
   # Keep the sudo timestamp fresh during long apt/colcon steps.
   ( while sleep 50; do sudo -n true 2>/dev/null || exit; kill -0 "$$" 2>/dev/null || exit; done ) &

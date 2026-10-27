@@ -5,35 +5,39 @@ ROS 2 Jazzy, the simulation packages we use in class, and Docker.
 
 ## Quick start
 
-Open a terminal and run **one** of these as your normal user (not `sudo`).
+1. Open a terminal (**Ctrl + Alt + T**).
+2. Copy **one** command below and paste it into the terminal (**Ctrl + Shift + V**), then press **Enter**.
+3. Type `y` and press **Enter** when it asks `Continue? [y/N]`.
+4. Type your login password when asked. **Nothing appears on screen while you type the password. That's normal.** Press **Enter** when you're done.
+5. Wait about 15 to 30 minutes. When it says **Done**, close the terminal and open a new one.
 
-### Laptop/PC with an NVIDIA GPU
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh | bash -s -- --docker gpu
-```
-
-Make sure the NVIDIA driver works first: `nvidia-smi` should list your GPU.
-If it doesn't, run `sudo ubuntu-drivers install && sudo reboot`, then try again.
-
-### Laptop/PC without an NVIDIA GPU
+### PC with an NVIDIA GPU
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh | bash -s -- --docker cpu
+curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh | bash -s gpu
 ```
 
-The script shows what it will install, asks `Continue? [y/N]`, then asks for
-your password once. It takes about 15 to 30 minutes, depending on your internet speed.
+### PC without an NVIDIA GPU
 
-When it finishes, **close the terminal and open a new one**, then check:
+```bash
+curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh | bash -s cpu
+```
+
+Not sure which one you have? Run `nvidia-smi`. If it prints a table with your GPU, use **gpu**. If not, use **cpu**.
+
+## Check it works
+
+In a **new** terminal:
 
 ```bash
 ros2 run demo_nodes_cpp talker
 ```
 
+You should see `Publishing: 'Hello World: 1'` and so on. Press **Ctrl + C** to stop.
+
 ## Try the simulations
 
-Run one at a time:
+Run one at a time, and press **Ctrl + C** to stop each one:
 
 ```bash
 ros2 launch ur_simulation_gz ur_sim_moveit.launch.py ur_type:=ur5e      # UR arm + MoveIt
@@ -45,53 +49,39 @@ source ~/ros2_workshop/rrbot_ws/install/setup.bash
 ros2 launch ros2_control_demo_example_1 rrbot.launch.py                  # RRBot
 ```
 
-To use Docker without `sudo`, log out and back in once. To check that containers can see your GPU (GPU mode only):
+## Other modes
+
+Swap the last word of the command:
+
+| Last word | What it installs |
+|---|---|
+| `gpu` | ROS 2 + simulation + Docker with NVIDIA GPU |
+| `cpu` | ROS 2 + simulation + Docker without GPU |
+| `ros` | ROS 2 + simulation, no Docker |
+| `docker-gpu` | Only Docker, with NVIDIA GPU |
+| `docker-cpu` | Only Docker, without GPU |
+
+For example, to install only Docker with GPU support:
 
 ```bash
-docker run --rm --gpus all ubuntu:24.04 nvidia-smi
+curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh | bash -s docker-gpu
 ```
 
-## What gets installed
-
-- ROS 2 Jazzy `desktop-full`, colcon, rosdep, plus `source /opt/ros/jazzy/setup.bash` added to `~/.bashrc`
-- Gazebo Harmonic, ros2_control, MoveIt 2, Universal Robots, Franka Panda, TurtleBot 4, Nav2, SLAM Toolbox
-- RRBot built from source in `~/ros2_workshop/rrbot_ws`
-- Docker + Compose, plus the NVIDIA Container Toolkit in GPU mode
-
-## Other options
-
 <details>
-<summary>More install variants and flags</summary>
+<summary>Advanced options (for instructors)</summary>
 
-Everything goes after `| bash -s --`:
+Add these after the mode, e.g. `| bash -s gpu --yes --skip-rrbot`:
 
 | Flag | What it does |
 |---|---|
-| `--docker gpu` | Docker with NVIDIA GPU support |
-| `--docker cpu` | Docker without GPU |
-| `--docker auto` | Picks GPU if `nvidia-smi` works, else CPU (the default if you leave out `--docker`) |
-| `--docker skip` | Don't touch Docker |
-| `--docker-only` | Only install Docker, no ROS 2 |
+| `--yes` | Don't ask for confirmation (lab imaging, scripts) |
 | `--no-sim` | Only ROS 2 desktop, no simulation packages |
 | `--skip-rrbot` | Don't build RRBot |
 | `--clone URL` | Also clone a workshop repo into `~/ros2_workshop` (can repeat) |
 | `--workspace PATH` | Use a different folder instead of `~/ros2_workshop` |
-| `--yes` | Don't ask for confirmation (lab imaging, scripts) |
+| `--docker auto` | Pick GPU or CPU automatically (the default when no mode is given) |
 
-Examples:
-
-```bash
-# Docker only, with GPU
-curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh | bash -s -- --docker-only --docker gpu
-
-# ROS 2 + simulation, no Docker
-curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh | bash -s -- --docker skip
-
-# GPU setup plus a workshop's own repo
-curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh | bash -s -- --docker gpu --clone https://github.com/runtimerobotics/vlm_packt_workshop.git
-```
-
-Want to read the script before running it?
+To read the script before running it:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/main/install.sh
@@ -100,11 +90,22 @@ bash install.sh --help
 
 </details>
 
+## What gets installed
+
+- ROS 2 Jazzy `desktop-full`, colcon and rosdep, with ROS set up automatically in every new terminal
+- Gazebo Harmonic, ros2_control, MoveIt 2, Universal Robots, Franka Panda, TurtleBot 4, Nav2, SLAM Toolbox
+- RRBot, built in `~/ros2_workshop/rrbot_ws`
+- Docker + Compose, plus NVIDIA GPU support for containers in `gpu` mode
+
 ## Troubleshooting
 
-- **Something failed partway:** fix the issue it reports, then run the same command again. It's safe to re-run, and anything already installed is skipped.
-- **"GPU mode needs a working NVIDIA driver":** install the driver (see Quick start) or use the CPU command.
-- **"ROS 2 packages are not visible to apt":** your network is blocking `packages.ros.org`. Try another network or ask your IT team to allow it.
-- **`docker: permission denied`:** log out and back in, or run `newgrp docker`.
+| Problem | Fix |
+|---|---|
+| It stopped with an error | Fix what it says, then run the same command again. It's safe to re-run, and anything already installed is skipped. |
+| "GPU mode needs a working NVIDIA driver" | Run `sudo ubuntu-drivers install`, reboot, and try again. Or use `cpu`. |
+| "ROS 2 packages are not visible to apt" | Your network blocks `packages.ros.org`. Try another network, such as a phone hotspot. |
+| A warning that `python3` is not `/usr/bin/python3` | Another Python (conda, pyenv, or one in `~/.local/bin`) is ahead of Ubuntu's. Deactivate or remove it before building ROS code. |
+| `docker: permission denied` | Log out and back in once, or run `newgrp docker`. |
+| `ros2: command not found` | Open a new terminal. The current one was opened before the install. |
 
-Requires Ubuntu 24.04 (64-bit, x86) and internet access. NVIDIA drivers are not installed by the script. In Docker mode it removes Ubuntu's `docker.io` package if present, but keeps your images.
+Requires Ubuntu 24.04 (64-bit) and internet access. The script doesn't install NVIDIA drivers.
