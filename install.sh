@@ -21,6 +21,7 @@
 # download does nothing and `curl | bash` reads the whole script before any
 # command can consume stdin.
 
+# shellcheck disable=SC1090,SC1091  # /etc/os-release and ROS setup files are sourced at runtime
 set -Eeuo pipefail
 
 readonly SCRIPT_VERSION="2026-10-27"
@@ -203,6 +204,9 @@ build_rrbot() {
   local repo="$RR_WORKSPACE/src/ros2_control_demos"
   mkdir -p "$RR_WORKSPACE/src"
   clone_once https://github.com/ros-controls/ros2_control_demos.git "$repo" --branch "$ROS_DISTRO_NAME"
+  set +u
+  source "/opt/ros/${ROS_DISTRO_NAME}/setup.bash"
+  set -u
   rosdep install --rosdistro "$ROS_DISTRO_NAME" --from-paths \
     "$repo/example_1" "$repo/ros2_control_demo_description" "$repo/ros2_control_demo_test_utils" \
     --ignore-src -r -y </dev/null
@@ -228,7 +232,7 @@ start_docker() {
     if ! sudo docker info >/dev/null 2>&1 && ! pgrep -x dockerd >/dev/null; then
       sudo sh -c 'nohup dockerd >/var/log/dockerd.log 2>&1 &'
     fi
-    local i; for i in $(seq 1 20); do sudo docker info >/dev/null 2>&1 && return; sleep 1; done
+    local _; for _ in $(seq 1 20); do sudo docker info >/dev/null 2>&1 && return; sleep 1; done
     die "Docker daemon did not start."
   fi </dev/null
 }
@@ -293,7 +297,6 @@ install_docker() {
 verify_ros() {
   say "Checking ROS 2 packages"
   set +u
-  # shellcheck disable=SC1090
   source "/opt/ros/${ROS_DISTRO_NAME}/setup.bash"
   [[ -n "${RR_WORKSPACE:-}" && -f "$RR_WORKSPACE/install/setup.bash" ]] && source "$RR_WORKSPACE/install/setup.bash"
   set -u
