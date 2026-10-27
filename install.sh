@@ -24,16 +24,66 @@
 # shellcheck disable=SC1090,SC1091  # /etc/os-release and ROS setup files are sourced at runtime
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="2026-10-27"
+readonly SCRIPT_VERSION="1.0.0"
 readonly ROS_DISTRO_NAME="jazzy"
 readonly TAG="[ros2-workshop]"
 readonly ROS_APT_SOURCE_FALLBACK="1.3.0"
+readonly LOG_FILE="$HOME/ros2_workshop_install.log"
+# Wait for unattended-upgrades/PackageKit instead of failing, retry flaky
+# mirrors, and never stop on a changed-config-file question.
+readonly APT_OPTS=(-o DPkg::Lock::Timeout=600 -o Acquire::Retries=3
+                   -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+RESULTS_OK=()
+RESULTS_FAIL=()
+CURRENT_STEP=""
+STARTED=false
+LOGGING=false
 
 say()  { printf '\n\033[1;34m%s\033[0m %s\n' "$TAG" "$*"; }
 ok()   { printf '  \033[1;32mOK\033[0m  %s\n' "$*"; }
 warn() { printf '\n\033[1;33m%s WARNING\033[0m %s\n' "$TAG" "$*" >&2; }
 die()  { printf '\n\033[1;31m%s ERROR\033[0m %s\n' "$TAG" "$*" >&2; exit 1; }
 trap '((BASH_SUBSHELL)) || printf "\n%s ERROR: command failed (line %s): %s\nRe-running the installer is safe once the problem is fixed.\n" "$TAG" "$LINENO" "$BASH_COMMAND" >&2' ERR
+
+# Steps and checks are counted for the final "N/M passed" summary.
+step()       { CURRENT_STEP="$1"; say "$1"; }
+step_done()  { [[ -z "$CURRENT_STEP" ]] || RESULTS_OK+=("$CURRENT_STEP"); CURRENT_STEP=""; }
+check_ok()   { ok "$1"; RESULTS_OK+=("$1"); }
+check_fail() { warn "$1${2:+: $2}"; RESULTS_FAIL+=("$1${2:+: $2}"); }
+run_step()   { step "$1"; shift; "$@"; step_done; }
+
+print_counts() {
+  local n_ok=${#RESULTS_OK[@]} n_fail=${#RESULTS_FAIL[@]} item
+  local total=$((n_ok + n_fail))
+  ((total > 0)) || return 0
+  if ((n_fail == 0)); then
+    printf '\n\033[1;32m%s Results: %d/%d passed, 0 failed\033[0m\n' "$TAG" "$n_ok" "$total"
+  else
+    printf '\n\033[1;31m%s Results: %d/%d passed, %d failed\033[0m\n' "$TAG" "$n_ok" "$total" "$n_fail"
+  fi
+  for item in "${RESULTS_OK[@]}"; do printf '  \033[32m✓\033[0m %s\n' "$item"; done
+  for item in "${RESULTS_FAIL[@]}"; do printf '  \033[31m✗\033[0m %s\n' "$item"; done
+}
+
+on_exit() {
+  local rc=$?
+  kill "${KEEPALIVE_PID:-}" 2>/dev/null || true
+  if [[ "$STARTED" == true ]]; then
+    if ((rc != 0)) && [[ -n "$CURRENT_STEP" ]]; then RESULTS_FAIL+=("$CURRENT_STEP (stopped the install)"); fi
+    print_counts
+    if ((${#RESULTS_FAIL[@]})); then
+      printf '\nRe-running the same command is safe. If it keeps failing, send this log to your instructor:\n  %s\n' "$LOG_FILE"
+    else
+      printf '\nLog: %s\n' "$LOG_FILE"
+    fi
+  fi
+  if [[ "$LOGGING" == true ]]; then
+    exec 1>&- 2>&-
+    wait "${TEE_PID:-}" 2>/dev/null || true
+  fi
+  exit "$rc"
+}
 
 usage() {
   cat <<'HELP'
@@ -63,11 +113,17 @@ What to install:
 
 General:
   --workspace PATH    Workspace for cloned/built code (default: ~/ros2_workshop)
+  --apt-proxy URL     Use a classroom apt cache, e.g. http://10.0.0.5:3142 (apt-cacher-ng)
+  --dry-run           Show what would be installed and exit without changing anything
   --yes, -y           Don't ask for confirmation
   --help, -h          Show this help
 
+The install log is written to ~/ros2_workshop_install.log. The script exits 0
+when every step and check passed, 1 when it stopped early, and 2 when it
+finished but some checks failed.
+
 Installed by default:
-  ROS 2 Jazzy desktop-full (falls back to desktop), ros-dev-tools, rosdep
+  ROS 2 Jazzy desktop-full (falls back to desktop), ros-dev-tools (colcon, rosdep, vcstool)
   Gazebo Harmonic (ros_gz), ros2_control + controllers + gz_ros2_control demos
   MoveIt 2, Franka Panda MoveIt config, Universal Robots + ur_simulation_gz
   TurtleBot 4 simulator, Nav2, SLAM Toolbox, cv_bridge, image_transport
@@ -95,8 +151,47 @@ ask() {
   printf '%s' "$reply"
 }
 
-apt_install() { sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" </dev/null; }
-apt_update()  { sudo apt-get update </dev/null; }
+retry() {
+  local n=1
+  until "$@"; do
+    ((n < 3)) || return 1
+    warn "Attempt $n failed, retrying in $((n * 10))s: $*"
+    sleep $((n * 10)); n=$((n + 1))
+  done
+}
+
+# apt-get's own lock timeout covers apt; this also covers plain dpkg calls and
+# tells students why nothing seems to happen.
+wait_for_dpkg_lock() {
+  command -v fuser >/dev/null 2>&1 || return 0
+  local waited=0
+  while sudo fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    ((waited > 0)) || say "Waiting for another software update to finish (this can take a few minutes)..."
+    ((waited < 900)) || die "Another program has been using apt for 15 minutes. Reboot and run the installer again."
+    sleep 5; waited=$((waited + 5))
+  done
+}
+
+apt_get() { wait_for_dpkg_lock; sudo DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" "$@" </dev/null; }
+apt_install() { apt_get install -y --no-install-recommends "$@"; }
+
+# A broken third-party source (old Chrome/VS Code/PPA key) makes apt-get
+# update fail. Stop only when a source the workshop needs is affected.
+apt_update() {
+  local out rc=0 problems
+  out="$(mktemp)"
+  apt_get update 2>&1 | tee "$out" || rc=$?
+  problems="$(grep -E '^(E:|Err:|W: Failed to fetch|W: GPG error)' "$out" || true)"
+  rm -f -- "$out"
+  [[ -n "$problems" || "$rc" -ne 0 ]] || return 0
+  if grep -qE 'packages\.ros\.org|download\.docker\.com|nvidia\.github\.io|ubuntu\.com/ubuntu' <<<"$problems"; then
+    printf '%s\n' "$problems" >&2
+    die "apt could not read a software source this installer needs (lines above). Check your internet connection, firewall or proxy, then re-run."
+  fi
+  warn "apt reported problems with other software sources that this workshop does not need; continuing.
+$problems
+  To silence this later, remove or fix the matching file in /etc/apt/sources.list.d/."
+}
 
 # Clone once; never touch an existing checkout.
 clone_once() {
@@ -106,36 +201,58 @@ clone_once() {
   elif [[ -e "$dest" ]]; then
     die "$dest exists but is not a git checkout"
   else
-    git clone --depth 1 "$@" "$url" "$dest" </dev/null
+    retry git clone --depth 1 "$@" "$url" "$dest" </dev/null || die "Could not clone $url (network problem?). Re-run the installer."
   fi
 }
 
 gpu_driver_ok() { command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; }
 
 install_base() {
-  say "Installing base Ubuntu packages"
+  if [[ -n "$APT_PROXY" ]]; then
+    echo "Acquire::http::Proxy \"$APT_PROXY\";" | sudo tee /etc/apt/apt.conf.d/01ros2-workshop-proxy >/dev/null
+    ok "apt will use the cache at $APT_PROXY"
+  fi
+  # A Ctrl+C, closed lid or power cut during an earlier apt run leaves dpkg
+  # half-done; finish it so re-running is always safe.
+  if sudo dpkg --audit 2>/dev/null | grep -q .; then
+    say "Finishing an earlier interrupted install"
+    wait_for_dpkg_lock
+    sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a </dev/null
+    apt_get -f install -y
+  fi
   apt_update
   apt_install software-properties-common ca-certificates curl gnupg lsb-release \
     git wget jq locales build-essential cmake pkg-config \
     python3-pip python3-venv python3-dev
   if ! locale -a 2>/dev/null | grep -qiE '^(en_US|C)\.utf-?8$'; then
-    sudo locale-gen en_US.UTF-8 </dev/null
+    sudo locale-gen en_US.UTF-8 >/dev/null </dev/null
   fi
 }
 
 install_ros() {
-  say "Configuring the ROS 2 apt repository"
   if apt-cache policy | grep -q '/universe '; then
     ok "universe repository already enabled"
   else
     sudo add-apt-repository -y universe </dev/null
     apt_update
   fi
+  # Pre-2025 instructions wrote ros2.list + ros-archive-keyring.gpg, whose key
+  # has since expired; ros2-apt-source is the upstream replacement and the two
+  # conflict (different Signed-By), so the old pair is removed.
+  local legacy_list=/etc/apt/sources.list.d/ros2.list legacy_key=/usr/share/keyrings/ros-archive-keyring.gpg
   if dpkg-query -W -f='${Status}' ros2-apt-source 2>/dev/null | grep -Fq 'install ok installed'; then
     ok "ros2-apt-source already installed"
-  elif apt-cache show "ros-${ROS_DISTRO_NAME}-desktop" >/dev/null 2>&1; then
-    ok "an existing ROS 2 apt source already provides Jazzy; keeping it"
+    if [[ -f "$legacy_list" ]]; then
+      sudo rm -f -- "$legacy_list" "$legacy_key"
+      ok "removed the old ros2.list that conflicts with it"
+    fi
+  elif [[ ! -f "$legacy_list" ]] && grep -rqs 'packages.ros.org/ros2' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+    ok "an existing ROS 2 apt source is configured; keeping it"
   else
+    if [[ -f "$legacy_list" ]]; then
+      say "Replacing the old ROS 2 apt source with ros2-apt-source"
+      sudo rm -f -- "$legacy_list" "$legacy_key"
+    fi
     # Resolve the latest release with git (no GitHub API, so a whole classroom
     # behind one IP doesn't hit the API rate limit); fall back to a known tag.
     local version codename deb
@@ -149,12 +266,12 @@ install_ros() {
       ok "installing ros2-apt-source $version"
       apt_install "$deb"
     else
-      # Same key and source the package would install, written by hand.
+      # Same key and source the package would install, in the legacy layout.
+      # The next run replaces it with ros2-apt-source once that downloads.
       warn "Could not download ros2-apt-source; configuring the ROS 2 apt source manually."
-      sudo curl -fsSL --retry 3 https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-        -o /usr/share/keyrings/ros-archive-keyring.gpg
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu ${codename} main" \
-        | sudo tee /etc/apt/sources.list.d/ros2.list >/dev/null
+      sudo curl -fsSL --retry 3 https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o "$legacy_key"
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=$legacy_key] http://packages.ros.org/ros2/ubuntu ${codename} main" \
+        | sudo tee "$legacy_list" >/dev/null
     fi
     rm -f -- "$deb"
   fi
@@ -162,23 +279,26 @@ install_ros() {
   apt-cache show "ros-${ROS_DISTRO_NAME}-desktop" >/dev/null 2>&1 \
     || die "ROS 2 packages are not visible to apt. Check that this machine can reach http://packages.ros.org (firewall/proxy) and re-run."
 
-  say "Installing ROS 2 Jazzy desktop"
+  step_done
+
+  step "Installing ROS 2 Jazzy desktop"
   if apt-cache show "ros-${ROS_DISTRO_NAME}-desktop-full" >/dev/null 2>&1; then
     ROS_DESKTOP_PACKAGE="ros-${ROS_DISTRO_NAME}-desktop-full"
   else
     warn "ros-${ROS_DISTRO_NAME}-desktop-full is not available; installing ros-${ROS_DISTRO_NAME}-desktop."
     ROS_DESKTOP_PACKAGE="ros-${ROS_DISTRO_NAME}-desktop"
   fi
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$ROS_DESKTOP_PACKAGE" </dev/null
+  apt_get install -y "$ROS_DESKTOP_PACKAGE"
+  step_done
 
-  say "Installing ROS 2 development tools"
-  apt_install ros-dev-tools python3-colcon-common-extensions python3-vcstool python3-rosdep
+  step "Installing ROS 2 development tools and rosdep"
+  apt_install ros-dev-tools
 
   if [[ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]]; then
     say "Initializing rosdep"
     sudo rosdep init </dev/null
   fi
-  rosdep update --rosdistro "$ROS_DISTRO_NAME" </dev/null
+  retry rosdep update --rosdistro "$ROS_DISTRO_NAME" </dev/null || die "rosdep update failed (network problem?). Re-run the installer."
 
   local line="source /opt/ros/${ROS_DISTRO_NAME}/setup.bash"
   if ! grep -Fxq "$line" "$HOME/.bashrc" 2>/dev/null; then
@@ -188,8 +308,7 @@ install_ros() {
 
 install_sim() {
   local d="ros-${ROS_DISTRO_NAME}"
-  say "Installing simulation packages (Gazebo, ros2_control, MoveIt 2, UR, Panda, TurtleBot 4, Nav2)"
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  apt_get install -y \
     "$d-tf2-tools" "$d-xacro" \
     "$d-robot-state-publisher" "$d-joint-state-publisher-gui" \
     "$d-ros-gz" "$d-ros-gz-sim-demos" \
@@ -202,11 +321,10 @@ install_sim() {
     "$d-turtlebot4-simulator" \
     "$d-navigation2" "$d-nav2-bringup" "$d-slam-toolbox" \
     "$d-cv-bridge" "$d-image-transport" \
-    "$d-rqt-joint-trajectory-controller" </dev/null
+    "$d-rqt-joint-trajectory-controller"
 }
 
 build_rrbot() {
-  say "Building RRBot from ros2_control_demos (${ROS_DISTRO_NAME} branch)"
   RR_WORKSPACE="$WORKSPACE_PATH/rrbot_ws"
   local repo="$RR_WORKSPACE/src/ros2_control_demos"
   mkdir -p "$RR_WORKSPACE/src"
@@ -226,8 +344,8 @@ clone_extras() {
   for url in "${EXTRA_CLONES[@]}"; do
     name="$(basename "${url%/}" .git)"
     [[ -n "$name" && "$name" != . && "$name" != / ]] || die "Cannot derive a folder name from $url"
-    say "Cloning $url"
     clone_once "$url" "$WORKSPACE_PATH/$name"
+    ok "cloned $url"
   done
 }
 
@@ -249,11 +367,15 @@ start_docker() {
 # https://docs.docker.com/engine/install/ubuntu/ and
 # https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
 install_docker() {
-  local mode="$1"
-  if docker compose version >/dev/null 2>&1 || sudo docker compose version >/dev/null 2>&1; then
+  local mode="$1" me
+  me="$(id -un)"
+  if [[ "$(docker context show 2>/dev/null || true)" == desktop-linux ]]; then
+    warn "Docker Desktop is the active Docker context. This installer sets up Docker Engine;
+  GPU containers (--gpus) don't work under Docker Desktop. Switch with: docker context use default"
+  fi
+  if dpkg -s docker-ce >/dev/null 2>&1 && { docker compose version >/dev/null 2>&1 || sudo docker compose version >/dev/null 2>&1; }; then
     ok "Docker and Compose v2 already installed"
   else
-    say "Installing Docker Engine and Compose v2"
     local pkg
     for pkg in docker.io docker-doc docker-compose docker-compose-v2 podman-docker containerd runc; do
       if dpkg -s "$pkg" >/dev/null 2>&1; then sudo apt-get remove -y "$pkg" </dev/null; fi
@@ -264,12 +386,14 @@ install_docker() {
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" \
       | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
     apt_update
-    apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    start_docker
+    # With recommends, like Docker's own guide (rootless extras, pigz).
+    apt_get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   fi
+  # Idempotent, and fixes a stopped or disabled daemon on an existing install.
+  start_docker
 
-  if ! id -nG "$USER" | grep -qw docker; then
-    sudo usermod -aG docker "$USER"
+  if ! id -nG "$me" | grep -qw docker; then
+    sudo usermod -aG docker "$me"
     DOCKER_RELOGIN=true
   fi
 
@@ -277,7 +401,7 @@ install_docker() {
     if command -v nvidia-ctk >/dev/null 2>&1; then
       ok "NVIDIA Container Toolkit already installed"
     else
-      say "Installing NVIDIA Container Toolkit"
+      ok "installing the NVIDIA Container Toolkit"
       curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
         | sudo gpg --dearmor --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
       curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
@@ -295,10 +419,30 @@ install_docker() {
     fi
   fi
 
+  step_done
+
+  # Checks only: a Docker Hub hiccup (classroom rate limits) must not throw
+  # away the rest of the install.
   say "Checking Docker"
-  sudo docker run --rm hello-world >/dev/null </dev/null && ok "docker run hello-world"
+  if sudo docker info >/dev/null 2>&1 </dev/null; then check_ok "Docker daemon running"; else check_fail "Docker daemon running" "see: sudo systemctl status docker"; fi
+  if sudo docker run --rm hello-world >/dev/null 2>&1 </dev/null; then
+    check_ok "Docker test container (hello-world)"
+  else
+    check_fail "Docker test container (hello-world)" "could not pull from Docker Hub (offline or rate-limited); try later: docker run --rm hello-world"
+  fi
   if [[ "$mode" == gpu ]]; then
-    sudo docker run --rm --gpus all ubuntu:24.04 nvidia-smi -L </dev/null && ok "GPU visible inside containers"
+    if sudo docker info --format '{{json .Runtimes}}' 2>/dev/null </dev/null | grep -q nvidia; then
+      check_ok "NVIDIA runtime registered with Docker"
+    else
+      check_fail "NVIDIA runtime registered with Docker" "run: sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker"
+    fi
+    if [[ "${ROS2_WORKSHOP_SKIP_GPU_RUN:-0}" == 1 ]]; then
+      ok "GPU container test skipped (ROS2_WORKSHOP_SKIP_GPU_RUN=1)"
+    elif sudo docker run --rm --gpus all ubuntu:24.04 nvidia-smi -L </dev/null; then
+      check_ok "GPU visible inside containers"
+    else
+      check_fail "GPU visible inside containers" "try later: docker run --rm --gpus all ubuntu:24.04 nvidia-smi"
+    fi
   fi
 }
 
@@ -317,7 +461,7 @@ verify_ros() {
   [[ -n "${RR_WORKSPACE:-}" ]] && checks+=("RRBot|ros2_control_demo_example_1")
   for entry in "${checks[@]}"; do
     label="${entry%%|*}" pkg="${entry#*|}"
-    if ros2 pkg prefix "$pkg" >/dev/null 2>&1; then ok "$label ($pkg)"; else warn "Not found: $label ($pkg)"; FAILED_CHECKS=true; fi
+    if ros2 pkg prefix "$pkg" >/dev/null 2>&1; then check_ok "Package found: $label ($pkg)"; else check_fail "Package found: $label ($pkg)" "not installed"; fi
   done
 }
 
@@ -356,9 +500,44 @@ EOF
   \"No module named 'catkin_pkg'\" while that one comes first on PATH. Remove it,
   move it later in PATH, or deactivate conda/venv/pyenv before building ROS code."
   fi
-  if [[ "${FAILED_CHECKS:-false}" == true ]]; then
-    warn "Some package checks failed; scroll up for details. Re-running the installer is safe."
+  if [[ "$INSTALL_ROS" == true && "$(basename "${SHELL:-bash}")" == zsh ]]; then
+    printf '\nYou use zsh: add ROS 2 to it with\n  echo "source /opt/ros/%s/setup.zsh" >> ~/.zshrc\n' "$ROS_DISTRO_NAME"
   fi
+}
+
+# Fail in the first seconds rather than 20 minutes in.
+preflight() {
+  local need=3 avail
+  [[ "$INSTALL_ROS" != true ]] || need=$((need + 5))
+  [[ "$INSTALL_SIM" != true ]] || need=$((need + 4))
+  [[ "$DOCKER_MODE" == skip ]] || need=$((need + 3))
+  avail="$(df -BG --output=avail / | tail -1 | tr -dc 0-9)"
+  if ((avail < need)); then
+    die "Not enough disk space: this needs about ${need} GB free on /, you have ${avail} GB. Free some space and re-run."
+  fi
+  check_ok "Disk space (${avail} GB free, about ${need} GB needed)"
+
+  command -v curl >/dev/null 2>&1 || return 0
+  local urls=(https://github.com) url unreachable=()
+  [[ "$INSTALL_ROS" != true ]] || urls+=(http://packages.ros.org/ros2/ubuntu/ https://raw.githubusercontent.com)
+  [[ "$DOCKER_MODE" == skip ]] || urls+=(https://download.docker.com)
+  [[ "$DOCKER_MODE" != gpu ]] || urls+=(https://nvidia.github.io)
+  for url in "${urls[@]}"; do
+    curl -sS -o /dev/null -m 20 --retry 2 "$url" 2>/dev/null || unreachable+=("$url")
+  done
+  if ((${#unreachable[@]})); then
+    die "Cannot reach: ${unreachable[*]}
+  Check your internet connection. On a university or office network a firewall may block these; try a phone hotspot."
+  fi
+  check_ok "Internet access to the package servers"
+}
+
+# Stop a laptop from suspending mid-install (the usual way dpkg gets
+# interrupted). The holder exits on its own when this script does.
+keep_awake() {
+  [[ -d /run/systemd/system ]] && command -v systemd-inhibit >/dev/null 2>&1 || return 0
+  systemd-inhibit --what=sleep:idle --who=ros2-workshop-setup --why="Installing ROS 2" \
+    bash -c "while kill -0 $$ 2>/dev/null; do sleep 5; done" >/dev/null 2>&1 &
 }
 
 main() {
@@ -370,6 +549,8 @@ main() {
   ASSUME_YES=false
   EXTRA_CLONES=()
   RR_WORKSPACE=""
+  APT_PROXY=""
+  DRY_RUN=false
 
   while (($#)); do
     case "$1" in
@@ -386,12 +567,16 @@ main() {
       --clone) (($# >= 2)) || die "--clone needs a URL"; EXTRA_CLONES+=("$2"); shift 2 ;;
       --workspace) (($# >= 2)) || die "--workspace needs a path"; WORKSPACE_PATH="$2"; shift 2 ;;
       --workspace=*) WORKSPACE_PATH="${1#*=}"; shift ;;
+      --apt-proxy) (($# >= 2)) || die "--apt-proxy needs a URL"; APT_PROXY="$2"; shift 2 ;;
+      --apt-proxy=*) APT_PROXY="${1#*=}"; shift ;;
+      --dry-run) DRY_RUN=true; shift ;;
       -y|--yes) ASSUME_YES=true; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "Unknown option: $1 (see --help)" ;;
     esac
   done
   case "$DOCKER_MODE" in auto|cpu|gpu|skip) ;; *) die "Invalid --docker mode: $DOCKER_MODE (auto|gpu|cpu|skip)" ;; esac
+  [[ -z "$APT_PROXY" || "$APT_PROXY" =~ ^https?://[^[:space:]\"]+$ ]] || die "--apt-proxy must be a URL like http://10.0.0.5:3142"
   [[ "$INSTALL_ROS" == true ]] || { INSTALL_SIM=false; BUILD_RRBOT=false; }
   [[ "$INSTALL_SIM" == true ]] || BUILD_RRBOT=false
   if [[ "$INSTALL_ROS" == false && "$DOCKER_MODE" == skip && ${#EXTRA_CLONES[@]} -eq 0 ]]; then
@@ -424,9 +609,17 @@ main() {
   if [[ "$DOCKER_MODE" == auto ]]; then
     if gpu_driver_ok; then DOCKER_MODE=gpu
     else DOCKER_MODE=cpu; warn "No working NVIDIA driver (nvidia-smi); using CPU Docker."; fi
-  elif [[ "$DOCKER_MODE" == gpu ]] && ! gpu_driver_ok; then
+  elif [[ "$DOCKER_MODE" == gpu ]] && ! gpu_driver_ok && [[ "$DRY_RUN" != true ]]; then
     die "GPU mode needs a working NVIDIA driver. Install one (sudo ubuntu-drivers install), reboot, and re-run, or use the cpu mode instead."
   fi
+
+  if [[ "$DRY_RUN" != true ]]; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    TEE_PID=$!
+    LOGGING=true
+    printf '\n===== %s =====\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  fi
+  trap on_exit EXIT
 
   say "ROS 2 workshop installer $SCRIPT_VERSION"
   printf '  ROS 2 Jazzy desktop:   %s\n' "$INSTALL_ROS"
@@ -435,6 +628,11 @@ main() {
   printf '  Docker:                %s\n' "$DOCKER_MODE"
   printf '  Workspace:             %s\n' "$WORKSPACE_PATH"
   ((${#EXTRA_CLONES[@]} == 0)) || printf '  Extra clones:          %s\n' "${EXTRA_CLONES[*]}"
+  [[ -z "$APT_PROXY" ]] || printf '  apt cache:             %s\n' "$APT_PROXY"
+  if [[ "$DRY_RUN" == true ]]; then
+    printf '\nDry run: nothing was changed.\n'
+    exit 0
+  fi
   printf '\nThis installs apt packages and apt sources with sudo and may restart Docker.\n'
   if [[ "$ASSUME_YES" != true ]]; then
     local reply
@@ -445,21 +643,32 @@ main() {
   say "Enter your login password if asked (nothing appears while you type; that is normal)"
   sudo -v
   # Keep the sudo timestamp fresh during long apt/colcon steps.
-  ( while sleep 50; do sudo -n true 2>/dev/null || exit; kill -0 "$$" 2>/dev/null || exit; done ) &
+  ( while sleep 50; do sudo -n true 2>/dev/null || exit; kill -0 "$$" 2>/dev/null || exit; done ) >/dev/null 2>&1 &
   KEEPALIVE_PID=$!
-  trap 'kill "${KEEPALIVE_PID:-}" 2>/dev/null || true' EXIT
+  keep_awake
+  STARTED=true
 
-  install_base
+  step "Checking this computer"
+  preflight
+  CURRENT_STEP=""
+  run_step "Installing base Ubuntu packages" install_base
   mkdir -p "$WORKSPACE_PATH"
   if [[ "$INSTALL_ROS" == true ]]; then
+    step "Configuring the ROS 2 apt repository"
     install_ros
-    [[ "$INSTALL_SIM" == true ]] && install_sim
-    [[ "$BUILD_RRBOT" == true ]] && build_rrbot
+    step_done
+    if [[ "$INSTALL_SIM" == true ]]; then
+      run_step "Installing simulation packages (Gazebo, ros2_control, MoveIt 2, UR, Panda, TurtleBot 4, Nav2)" install_sim
+    fi
+    if [[ "$BUILD_RRBOT" == true ]]; then
+      run_step "Building RRBot from ros2_control_demos (${ROS_DISTRO_NAME} branch)" build_rrbot
+    fi
   fi
-  ((${#EXTRA_CLONES[@]} == 0)) || clone_extras
-  if [[ "$DOCKER_MODE" != skip ]]; then install_docker "$DOCKER_MODE"; fi
-  [[ "$INSTALL_ROS" == true ]] && verify_ros
+  if ((${#EXTRA_CLONES[@]})); then run_step "Cloning workshop repositories" clone_extras; fi
+  if [[ "$DOCKER_MODE" != skip ]]; then run_step "Installing Docker ($DOCKER_MODE)" install_docker "$DOCKER_MODE"; fi
+  if [[ "$INSTALL_ROS" == true ]]; then verify_ros; fi
   print_summary
+  ((${#RESULTS_FAIL[@]} == 0)) || exit 2
 }
 
 main "$@"

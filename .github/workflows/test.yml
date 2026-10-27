@@ -4,7 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, so an upstream ROS sync that breaks a package shows up days
+  # before a workshop instead of on the day.
+  schedule:
+    - cron: "0 3 * * 1"
   workflow_dispatch:
+    inputs:
+      real_gpu:
+        description: "Also run on the self-hosted GPU runner (labels: self-hosted, gpu)"
+        type: boolean
+        default: false
 
 jobs:
   lint:
@@ -13,9 +22,23 @@ jobs:
       - uses: actions/checkout@v4
       - run: shellcheck install.sh
       - run: bash install.sh --help
+      - name: Argument parsing (dry run)
+        run: |
+          fails() { if "$@"; then echo "::error::expected this to fail: $*"; exit 1; fi; }
+          bash install.sh --dry-run cpu
+          bash install.sh --dry-run docker-gpu
+          bash install.sh --dry-run ros --no-sim --skip-rrbot
+          bash install.sh --dry-run --docker=cpu --workspace ~/ws --clone https://github.com/ros/rosdistro.git
+          bash install.sh --dry-run cpu --apt-proxy http://10.0.0.5:3142
+          fails bash install.sh --dry-run bogus
+          fails bash install.sh --dry-run --docker banana
+          fails bash install.sh --dry-run --clone
+          fails bash install.sh --dry-run --apt-proxy ftp://x
+          fails bash install.sh --dry-run --no-ros --docker skip
 
-  # Full install on a fresh ubuntu:24.04 container, piped like `curl | bash`.
-  # No systemd in containers, so Docker is skipped here and covered below.
+  # Fresh ubuntu:24.04 container, piped like `curl | bash`, with a venv python3
+  # first on PATH (like conda/pyenv/~/.local) that must not break the build.
+  # No systemd in containers, so Docker is covered by the host jobs.
   container:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -27,21 +50,63 @@ jobs:
           apt-get update && apt-get install -y sudo curl python3-venv
           useradd -m -s /bin/bash student
           echo 'student ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/student
-      # A venv python first on PATH (like conda/pyenv/~/.local) must not break the build.
-      - name: Install (piped, with a shadowing python3 on PATH)
+      - name: Install (piped, shadowing python3 on PATH)
         run: |
           su student -c "python3 -m venv ~/shadow-venv"
           su student -c "cd ~ && export PATH=\$HOME/shadow-venv/bin:\$PATH && cat $GITHUB_WORKSPACE/install.sh | bash -s ros --yes"
+      - name: Shadowing python3 was detected and the log was written
+        run: |
+          grep -q "not Ubuntu's /usr/bin/python3" /home/student/ros2_workshop_install.log
+          grep -q "Results: .* 0 failed" /home/student/ros2_workshop_install.log
       - name: Re-run is safe
-        run: su student -c "cd ~ && bash $GITHUB_WORKSPACE/install.sh --yes --docker skip"
+        run: su student -c "cd ~ && bash $GITHUB_WORKSPACE/install.sh ros --yes"
+      - run: df -h /
 
-  # Ubuntu 24.04 VM with systemd: ROS + simulation + Docker CPU mode.
+  # Ubuntu 24.04 VMs with systemd, one per mode. Every run is repeated to
+  # cover the "already installed" paths (Docker, docker group, clones).
   host:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cpu
+            args: cpu
+          - name: docker-cpu
+            args: docker-cpu
+          - name: ros --no-sim
+            args: ros --no-sim
+          # Everything on the GPU path except the real driver: a stub
+          # nvidia-smi, toolkit install, runtime configure, daemon restart.
+          - name: gpu (stub driver)
+            args: gpu
+            stub_gpu: true
+    name: host (${{ matrix.name }})
+    env:
+      ROS2_WORKSHOP_SKIP_GPU_RUN: ${{ matrix.stub_gpu && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Stub nvidia-smi
+        if: matrix.stub_gpu
+        run: |
+          printf '#!/bin/sh\necho "GPU 0: Stub GPU (UUID: GPU-00000000)"\n' | sudo tee /usr/local/bin/nvidia-smi >/dev/null
+          sudo chmod +x /usr/local/bin/nvidia-smi
+      - run: df -h /
       - name: Install (piped)
-        run: cat install.sh | bash -s cpu --yes
+        run: cat install.sh | bash -s ${{ matrix.args }} --yes
+      - name: Re-run is safe
+        run: bash install.sh ${{ matrix.args }} --yes
+      - run: df -h /
+
+  # The real GPU path, on a machine with an NVIDIA GPU registered as a
+  # self-hosted runner. Manual only; run it before each workshop.
+  real-gpu:
+    if: github.event_name == 'workflow_dispatch' && inputs.real_gpu
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash install.sh gpu --yes
