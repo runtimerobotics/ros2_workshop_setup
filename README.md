@@ -23,13 +23,13 @@ several GB and takes 15 to 30 minutes.
 ### PC with an NVIDIA GPU
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/v1.0.0/install.sh | bash -s gpu
+curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/release-1.0.0/install.sh | bash -s gpu
 ```
 
 ### PC without an NVIDIA GPU
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/v1.0.0/install.sh | bash -s cpu
+curl -fsSL https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/release-1.0.0/install.sh | bash -s cpu
 ```
 
 ### Which one do I need?
@@ -95,7 +95,7 @@ Add these after the mode, e.g. `| bash -s gpu --yes --skip-rrbot`:
 | `--apt-proxy URL` | Use a classroom apt cache (apt-cacher-ng), e.g. `http://10.0.0.5:3142` |
 | `--docker auto` | Pick GPU or CPU automatically (the default when no mode is given) |
 
-**Versions.** The commands above are pinned to the `v1.0.0` release, so every student runs the same script. `main` is for development. Before a workshop, tag a new release and update the links here.
+**Versions.** The commands above are pinned to the `release-1.0.0` branch, so every student runs the same script. `main` is for development. Before a workshop, create a new `release-x.y.z` branch from `main` and update the links here. Don't push to a release branch once students are using it.
 
 **Exit codes:** `0` means everything passed, `1` means it stopped early, and `2` means it finished but some checks failed. Every run is logged to `~/ros2_workshop_install.log`.
 
@@ -104,7 +104,7 @@ Add these after the mode, e.g. `| bash -s gpu --yes --skip-rrbot`:
 To read the script before running it:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/v1.0.0/install.sh
+curl -fsSLO https://raw.githubusercontent.com/runtimerobotics/ros2_workshop_setup/release-1.0.0/install.sh
 bash install.sh --help
 ```
 
