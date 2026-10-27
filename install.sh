@@ -210,7 +210,8 @@ build_rrbot() {
   rosdep install --rosdistro "$ROS_DISTRO_NAME" --from-paths \
     "$repo/example_1" "$repo/ros2_control_demo_description" "$repo/ros2_control_demo_test_utils" \
     --ignore-src -r -y </dev/null
-  ( cd "$RR_WORKSPACE" && colcon build --symlink-install --packages-up-to ros2_control_demo_example_1 </dev/null )
+  ( cd "$RR_WORKSPACE" && colcon build --symlink-install --packages-up-to ros2_control_demo_example_1 \
+      --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 -DPYTHON_EXECUTABLE=/usr/bin/python3 </dev/null )
 }
 
 clone_extras() {
@@ -342,6 +343,12 @@ EOF
   if [[ "$DOCKER_MODE" == gpu ]]; then
     printf 'GPU containers: docker run --rm --gpus all ubuntu:24.04 nvidia-smi\n'
   fi
+  if [[ -n "${SHADOW_PYTHON:-}" ]]; then
+    warn "'python3' in your shell is $SHADOW_PYTHON, not Ubuntu's /usr/bin/python3.
+  ROS 2 Jazzy needs /usr/bin/python3 (3.12); colcon builds will fail with errors like
+  \"No module named 'catkin_pkg'\" while that one comes first on PATH. Remove it,
+  move it later in PATH, or deactivate conda/venv/pyenv before building ROS code."
+  fi
   if [[ "${FAILED_CHECKS:-false}" == true ]]; then
     warn "Some package checks failed; scroll up for details. Re-running the installer is safe."
   fi
@@ -379,6 +386,16 @@ main() {
   [[ "$INSTALL_SIM" == true ]] || BUILD_RRBOT=false
   if [[ "$INSTALL_ROS" == false && "$DOCKER_MODE" == skip && ${#EXTRA_CLONES[@]} -eq 0 ]]; then
     die "Nothing to do: --no-ros together with --docker skip."
+  fi
+
+  # ROS 2 Jazzy is built against Ubuntu's Python. A conda/venv/pyenv or
+  # ~/.local python3 earlier on PATH breaks rosdep/colcon, so put /usr/bin first.
+  SHADOW_PYTHON=""
+  if [[ "$(command -v python3 || true)" != /usr/bin/python3 ]]; then
+    SHADOW_PYTHON="$(command -v python3 || true)"
+    warn "Ignoring $SHADOW_PYTHON for this install and using Ubuntu's /usr/bin/python3."
+    export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+    unset PYTHONPATH PYTHONHOME VIRTUAL_ENV CONDA_PREFIX
   fi
 
   ((EUID != 0)) || die "Run as your normal user, not root/sudo. The script calls sudo itself."

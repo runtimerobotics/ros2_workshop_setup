@@ -24,11 +24,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Create a sudo user like a workshop laptop
         run: |
-          apt-get update && apt-get install -y sudo curl
+          apt-get update && apt-get install -y sudo curl python3-venv
           useradd -m -s /bin/bash student
           echo 'student ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/student
-      - name: Install (piped)
-        run: su student -c "cd ~ && cat $GITHUB_WORKSPACE/install.sh | bash -s -- --yes --docker skip"
+      # A venv python first on PATH (like conda/pyenv/~/.local) must not break the build.
+      - name: Install (piped, with a shadowing python3 on PATH)
+        run: |
+          su student -c "python3 -m venv ~/shadow-venv"
+          su student -c "cd ~ && export PATH=\$HOME/shadow-venv/bin:\$PATH && cat $GITHUB_WORKSPACE/install.sh | bash -s -- --yes --docker skip"
       - name: Re-run is safe
         run: su student -c "cd ~ && bash $GITHUB_WORKSPACE/install.sh --yes --docker skip"
 
